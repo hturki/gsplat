@@ -442,6 +442,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     const int tile_width, const int tile_height,
     const int32_t *__restrict__ tile_offsets, // [C, tile_height, tile_width]
     const int32_t *__restrict__ gauss_ids,    // [n_isects]
+    const int cameras_per_scene,
     float *__restrict__ render_colors,  // [C, image_height, image_width, COLOR_DIM]
     double *__restrict__ render_alphas, // [C, image_height, image_width, 1]
     int32_t *__restrict__ last_ids      // [C, image_height, image_width]
@@ -450,10 +451,10 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     // shared tile
 
     auto block = cg::this_thread_block();
-    int32_t camera_id = block.group_index().x;
-    int32_t tile_id = block.group_index().y * tile_width + block.group_index().z;
-    unsigned i = block.group_index().y * tile_size + block.thread_index().y;
-    unsigned j = block.group_index().z * tile_size + block.thread_index().x;
+    const int32_t camera_id = block.group_index().x;
+    const int32_t tile_id = block.group_index().y * tile_width + block.group_index().z;
+    const unsigned i = block.group_index().y * tile_size + block.thread_index().y;
+    const unsigned j = block.group_index().z * tile_size + block.thread_index().x;
 
     // move pointers to the current camera
     means2d += camera_id * N;
@@ -463,6 +464,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     render_colors += camera_id * image_height * image_width * COLOR_DIM;
     render_alphas += camera_id * image_height * image_width;
     last_ids += camera_id * image_height * image_width;
+    const int32_t scene_id = camera_id / cameras_per_scene;
+    opacities += (scene_id * N);
 
     float px = (float)j + 0.5f;
     float py = (float)i + 0.5f;
@@ -577,12 +580,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_fwd_
     const torch::Tensor &means2d,   // [C, N, 2]
     const torch::Tensor &conics,    // [C, N, 3]
     const torch::Tensor &colors,    // [C, N, 3]
-    const torch::Tensor &opacities, // [N]
+    const torch::Tensor &opacities, // [S, N]
     // image size
     const int image_width, const int image_height, const int tile_size,
     // intersections
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
-    const torch::Tensor &gauss_ids     // [n_isects]
+    const torch::Tensor &gauss_ids,     // [n_isects]
+    const int cameras_per_scene // S
 ) {
     DEVICE_GUARD(means2d);
     CHECK_INPUT(means2d);
@@ -623,7 +627,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_fwd_
             (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
             opacities.data_ptr<float>(), image_width, image_height, tile_size,
             tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-            gauss_ids.data_ptr<int32_t>(), renders.data_ptr<float>(),
+            gauss_ids.data_ptr<int32_t>(), cameras_per_scene, renders.data_ptr<float>(),
             alphas.data_ptr<double>(), last_ids.data_ptr<int32_t>());
         break;
     case 2:
@@ -632,7 +636,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_fwd_
             (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
             opacities.data_ptr<float>(), image_width, image_height, tile_size,
             tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-            gauss_ids.data_ptr<int32_t>(), renders.data_ptr<float>(),
+            gauss_ids.data_ptr<int32_t>(), cameras_per_scene, renders.data_ptr<float>(),
             alphas.data_ptr<double>(), last_ids.data_ptr<int32_t>());
         break;
     case 3:
@@ -641,7 +645,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_fwd_
             (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
             opacities.data_ptr<float>(), image_width, image_height, tile_size,
             tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-            gauss_ids.data_ptr<int32_t>(), renders.data_ptr<float>(),
+            gauss_ids.data_ptr<int32_t>(), cameras_per_scene, renders.data_ptr<float>(),
             alphas.data_ptr<double>(), last_ids.data_ptr<int32_t>());
         break;
     case 4:
@@ -650,7 +654,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_fwd_
             (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
             opacities.data_ptr<float>(), image_width, image_height, tile_size,
             tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-            gauss_ids.data_ptr<int32_t>(), renders.data_ptr<float>(),
+            gauss_ids.data_ptr<int32_t>(), cameras_per_scene, renders.data_ptr<float>(),
             alphas.data_ptr<double>(), last_ids.data_ptr<int32_t>());
         break;
     case 8:
@@ -659,7 +663,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_fwd_
             (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
             opacities.data_ptr<float>(), image_width, image_height, tile_size,
             tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-            gauss_ids.data_ptr<int32_t>(), renders.data_ptr<float>(),
+            gauss_ids.data_ptr<int32_t>(), cameras_per_scene, renders.data_ptr<float>(),
             alphas.data_ptr<double>(), last_ids.data_ptr<int32_t>());
         break;
     case 16:
@@ -668,7 +672,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_fwd_
             (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
             opacities.data_ptr<float>(), image_width, image_height, tile_size,
             tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-            gauss_ids.data_ptr<int32_t>(), renders.data_ptr<float>(),
+            gauss_ids.data_ptr<int32_t>(), cameras_per_scene, renders.data_ptr<float>(),
             alphas.data_ptr<double>(), last_ids.data_ptr<int32_t>());
         break;
     case 32:
@@ -677,7 +681,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_fwd_
             (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
             opacities.data_ptr<float>(), image_width, image_height, tile_size,
             tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-            gauss_ids.data_ptr<int32_t>(), renders.data_ptr<float>(),
+            gauss_ids.data_ptr<int32_t>(), cameras_per_scene, renders.data_ptr<float>(),
             alphas.data_ptr<double>(), last_ids.data_ptr<int32_t>());
         break;
     case 64:
@@ -686,7 +690,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_fwd_
             (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
             opacities.data_ptr<float>(), image_width, image_height, tile_size,
             tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-            gauss_ids.data_ptr<int32_t>(), renders.data_ptr<float>(),
+            gauss_ids.data_ptr<int32_t>(), cameras_per_scene, renders.data_ptr<float>(),
             alphas.data_ptr<double>(), last_ids.data_ptr<int32_t>());
         break;
     case 128:
@@ -695,7 +699,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_fwd_
             (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
             opacities.data_ptr<float>(), image_width, image_height, tile_size,
             tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-            gauss_ids.data_ptr<int32_t>(), renders.data_ptr<float>(),
+            gauss_ids.data_ptr<int32_t>(), cameras_per_scene, renders.data_ptr<float>(),
             alphas.data_ptr<double>(), last_ids.data_ptr<int32_t>());
         break;
     case 256:
@@ -704,7 +708,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_fwd_
             (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
             opacities.data_ptr<float>(), image_width, image_height, tile_size,
             tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-            gauss_ids.data_ptr<int32_t>(), renders.data_ptr<float>(),
+            gauss_ids.data_ptr<int32_t>(), cameras_per_scene, renders.data_ptr<float>(),
             alphas.data_ptr<double>(), last_ids.data_ptr<int32_t>());
         break;
     case 512:
@@ -713,7 +717,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_fwd_
             (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
             opacities.data_ptr<float>(), image_width, image_height, tile_size,
             tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-            gauss_ids.data_ptr<int32_t>(), renders.data_ptr<float>(),
+            gauss_ids.data_ptr<int32_t>(), cameras_per_scene, renders.data_ptr<float>(),
             alphas.data_ptr<double>(), last_ids.data_ptr<int32_t>());
         break;
     default:
@@ -729,11 +733,12 @@ __global__ void rasterize_to_pixels_bwd_kernel(
     const float2 *__restrict__ means2d,  // [C, N, 2]
     const float3 *__restrict__ conics,   // [C, N, 3]
     const float *__restrict__ colors,    // [C, N, COLOR_DIM]
-    const float *__restrict__ opacities, // [N]
+    const float *__restrict__ opacities, // [S, N]
     const int image_width, const int image_height, const int tile_size,
     const int tile_width, const int tile_height,
     const int32_t *__restrict__ tile_offsets, // [C, tile_height, tile_width]
     const int32_t *__restrict__ gauss_ids,    // [n_isects]
+    const int cameras_per_scene, // S
     // fwd outputs
     const double *__restrict__ render_alphas, // [C, image_height, image_width, 1]
     const int32_t *__restrict__ last_ids,     // [C, image_height, image_width]
@@ -745,13 +750,13 @@ __global__ void rasterize_to_pixels_bwd_kernel(
     float2 *__restrict__ v_means2d, // [C, N, 2]
     float3 *__restrict__ v_conics,  // [C, N, 3]
     float *__restrict__ v_colors,   // [C, N, COLOR_DIM]
-    float *__restrict__ v_opacities // [N]
+    float *__restrict__ v_opacities // [S, N]
 ) {
     auto block = cg::this_thread_block();
-    int32_t camera_id = block.group_index().x;
-    int32_t tile_id = block.group_index().y * tile_width + block.group_index().z;
-    unsigned i = block.group_index().y * tile_size + block.thread_index().y;
-    unsigned j = block.group_index().z * tile_size + block.thread_index().x;
+    const int32_t camera_id = block.group_index().x;
+    const int32_t tile_id = block.group_index().y * tile_width + block.group_index().z;
+    const unsigned i = block.group_index().y * tile_size + block.thread_index().y;
+    const unsigned j = block.group_index().z * tile_size + block.thread_index().x;
 
     // move pointers to the current camera
     means2d += camera_id * N;
@@ -765,6 +770,9 @@ __global__ void rasterize_to_pixels_bwd_kernel(
     v_means2d += camera_id * N;
     v_conics += camera_id * N;
     v_colors += camera_id * N * COLOR_DIM;
+    const int32_t scene_id = camera_id / cameras_per_scene;
+    opacities += (scene_id * N);
+    v_opacities += (scene_id * N);
 
     const float px = (float)j + 0.5f;
     const float py = (float)i + 0.5f;
@@ -945,12 +953,13 @@ rasterize_to_pixels_bwd_tensor(
     const torch::Tensor &means2d,   // [C, N, 2]
     const torch::Tensor &conics,    // [C, N, 3]
     const torch::Tensor &colors,    // [C, N, 3]
-    const torch::Tensor &opacities, // [N]
+    const torch::Tensor &opacities, // [S, N]
     // image size
     const int image_width, const int image_height, const int tile_size,
     // intersections
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
     const torch::Tensor &gauss_ids,    // [n_isects]
+    const int cameras_per_scene, // S
     // forward outputs
     const torch::Tensor &render_alphas, // [C, image_height, image_width, 1]
     const torch::Tensor &last_ids,      // [C, image_height, image_width]
@@ -985,7 +994,7 @@ rasterize_to_pixels_bwd_tensor(
     torch::Tensor v_means2d = torch::zeros({C, N, 2}, means2d.options());
     torch::Tensor v_conics = torch::zeros({C, N, 3}, conics.options());
     torch::Tensor v_colors = torch::zeros({C, N, COLOR_DIM}, colors.options());
-    torch::Tensor v_opacities = torch::zeros({N}, opacities.options());
+    torch::Tensor v_opacities = torch::zeros_like(opacities);
 
     if (n_isects) {
         at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
@@ -996,7 +1005,7 @@ rasterize_to_pixels_bwd_tensor(
                 (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
                 opacities.data_ptr<float>(), image_width, image_height, tile_size,
                 tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-                gauss_ids.data_ptr<int32_t>(), render_alphas.data_ptr<double>(),
+                gauss_ids.data_ptr<int32_t>(), cameras_per_scene, render_alphas.data_ptr<double>(),
                 last_ids.data_ptr<int32_t>(), v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 (float2 *)v_means2d.data_ptr<float>(),
@@ -1009,7 +1018,7 @@ rasterize_to_pixels_bwd_tensor(
                 (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
                 opacities.data_ptr<float>(), image_width, image_height, tile_size,
                 tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-                gauss_ids.data_ptr<int32_t>(), render_alphas.data_ptr<double>(),
+                gauss_ids.data_ptr<int32_t>(), cameras_per_scene, render_alphas.data_ptr<double>(),
                 last_ids.data_ptr<int32_t>(), v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 (float2 *)v_means2d.data_ptr<float>(),
@@ -1022,7 +1031,7 @@ rasterize_to_pixels_bwd_tensor(
                 (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
                 opacities.data_ptr<float>(), image_width, image_height, tile_size,
                 tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-                gauss_ids.data_ptr<int32_t>(), render_alphas.data_ptr<double>(),
+                gauss_ids.data_ptr<int32_t>(), cameras_per_scene, render_alphas.data_ptr<double>(),
                 last_ids.data_ptr<int32_t>(), v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 (float2 *)v_means2d.data_ptr<float>(),
@@ -1035,7 +1044,7 @@ rasterize_to_pixels_bwd_tensor(
                 (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
                 opacities.data_ptr<float>(), image_width, image_height, tile_size,
                 tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-                gauss_ids.data_ptr<int32_t>(), render_alphas.data_ptr<double>(),
+                gauss_ids.data_ptr<int32_t>(), cameras_per_scene, render_alphas.data_ptr<double>(),
                 last_ids.data_ptr<int32_t>(), v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 (float2 *)v_means2d.data_ptr<float>(),
@@ -1048,7 +1057,7 @@ rasterize_to_pixels_bwd_tensor(
                 (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
                 opacities.data_ptr<float>(), image_width, image_height, tile_size,
                 tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-                gauss_ids.data_ptr<int32_t>(), render_alphas.data_ptr<double>(),
+                gauss_ids.data_ptr<int32_t>(), cameras_per_scene, render_alphas.data_ptr<double>(),
                 last_ids.data_ptr<int32_t>(), v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 (float2 *)v_means2d.data_ptr<float>(),
@@ -1061,7 +1070,7 @@ rasterize_to_pixels_bwd_tensor(
                 (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
                 opacities.data_ptr<float>(), image_width, image_height, tile_size,
                 tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-                gauss_ids.data_ptr<int32_t>(), render_alphas.data_ptr<double>(),
+                gauss_ids.data_ptr<int32_t>(), cameras_per_scene, render_alphas.data_ptr<double>(),
                 last_ids.data_ptr<int32_t>(), v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 (float2 *)v_means2d.data_ptr<float>(),
@@ -1074,7 +1083,7 @@ rasterize_to_pixels_bwd_tensor(
                 (float3 *)conics.data_ptr<float>(), colors.data_ptr<float>(),
                 opacities.data_ptr<float>(), image_width, image_height, tile_size,
                 tile_width, tile_height, tile_offsets.data_ptr<int32_t>(),
-                gauss_ids.data_ptr<int32_t>(), render_alphas.data_ptr<double>(),
+                gauss_ids.data_ptr<int32_t>(), cameras_per_scene, render_alphas.data_ptr<double>(),
                 last_ids.data_ptr<int32_t>(), v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 (float2 *)v_means2d.data_ptr<float>(),

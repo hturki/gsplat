@@ -1,4 +1,4 @@
-from typing import Callable, Tuple
+from typing import Callable, Tuple, Optional
 
 import torch
 from torch import Tensor
@@ -97,12 +97,13 @@ def world_to_cam(
 
 
 def projection(
-    means: Tensor,  # [N, 3]
-    covars: Tensor,  # [N, 6]
+    means: Tensor,  # [S, N, 3]
+    covars: Tensor,  # [S, N, 6]
     viewmats: Tensor,  # [C, 4, 4]
     Ks: Tensor,  # [C, 3, 3]
     width: int,
     height: int,
+    cameras_per_scene: Optional[int] = None, # S
     eps2d: float = 0.3,
     near_plane: float = 0.01,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -115,12 +116,13 @@ def projection(
         the output tensors and will be ignored in the next rasterization process.
 
     Args:
-        means: Gaussian means. [N, 3]
-        covars: Gaussian covariances (flattened upper triangle). [N, 6]
+        means: Gaussian means. [N, 3] if cameras_per_scene is None else [C // S, N, 3]
+        covars: Gaussian covariances (flattened upper triangle). [N, 6] if cameras_per_scene is None else [C // S, N, 6]
         viewmats: Camera-to-world matrices. [C, 4, 4]
         Ks: Camera intrinsics. [C, 3, 3]
         width: Image width.
         height: Image height.
+        cameras_per_scene: Cameras per scene (S). Default 1.
         eps2d: A epsilon added to the projected covariance for numerical stability. Default: 0.3.
         near_plane: Near plane distance. Default: 0.01.
 
@@ -134,9 +136,16 @@ def projection(
             triangle with [C, N, 3]
     """
     C = viewmats.size(0)
-    N = means.size(0)
-    assert means.size() == (N, 3), means.size()
-    assert covars.size() == (N, 6), covars.size()
+    if cameras_per_scene is None:
+        cameras_per_scene = C
+    assert cameras_per_scene > 0, cameras_per_scene
+    assert C % cameras_per_scene == 0, C % cameras_per_scene
+    if len(means.shape) == 2:
+        means = means.unsqueeze(0)
+        covars = covars.unsqueeze(0)
+    N = means.size(1)
+    assert means.size() == (C // cameras_per_scene, N, 3), means.size()
+    assert covars.size() == (C  // cameras_per_scene, N, 6), covars.size()
     assert viewmats.size() == (C, 4, 4), viewmats.size()
     assert Ks.size() == (C, 3, 3), Ks.size()
     means = means.contiguous()
@@ -144,7 +153,7 @@ def projection(
     viewmats = viewmats.contiguous()
     Ks = Ks.contiguous()
     return _Projection.apply(
-        means, covars, viewmats, Ks, width, height, eps2d, near_plane
+        means, covars, viewmats, Ks, width, height, cameras_per_scene, eps2d, near_plane
     )
 
 
@@ -219,17 +228,25 @@ def rasterize_to_pixels(
     means2d: Tensor,  # [C, N, 2]
     conics: Tensor,  # [C, N, 3]
     colors: Tensor,  # [C, N, channels]
-    opacities: Tensor,  # [N]
+    opacities: Tensor,  # [N] if cameras_per_scene is None else [C // S, N]
     image_width: int,
     image_height: int,
     tile_size: int,
     isect_offsets: Tensor,  # [C, tile_height, tile_width]
     gauss_ids: Tensor,  # [n_isects]
+    cameras_per_scene: Optional[int] = None, # S
 ) -> Tuple[Tensor, Tensor]:
     C, N, _ = means2d.shape
+    if cameras_per_scene is None:
+        cameras_per_scene = C
+    assert cameras_per_scene > 0, cameras_per_scene
+    assert C % cameras_per_scene == 0, C % cameras_per_scene
     assert conics.shape == (C, N, 3), conics.shape
     assert colors.shape[:2] == (C, N), colors.shape
-    assert opacities.shape == (N,), opacities.shape
+    assert cameras_per_scene > 0, cameras_per_scene
+    if len(opacities.shape) == 1:
+        opacities = opacities.unsqueeze(0)
+    assert opacities.shape == (C // cameras_per_scene, N,), opacities.shape
     assert isect_offsets.shape[0] == C, isect_offsets.shape
 
     # Pad the channels to the nearest supported number if necessary
@@ -263,6 +280,7 @@ def rasterize_to_pixels(
         tile_size,
         isect_offsets.contiguous(),
         gauss_ids.contiguous(),
+        cameras_per_scene,
     )
     if padded_channels > 0:
         render_colors = render_colors[..., :-padded_channels]
@@ -430,21 +448,23 @@ class _Projection(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        means: Tensor,  # [N, 3]
-        covars: Tensor,  # [N, 6]
+        means: Tensor,  # [S, N, 3]
+        covars: Tensor,  # [S, N, 6]
         viewmats: Tensor,  # [C, 4, 4]
         Ks: Tensor,  # [C, 3, 3]
         width: int,
         height: int,
+        cameras_per_scene: int, # S
         eps2d: float,
         near_plane: float,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         radii, means2d, depths, conics = _make_lazy_cuda_func("projection_fwd")(
-            means, covars, viewmats, Ks, width, height, eps2d, near_plane
+            means, covars, viewmats, Ks, width, height, cameras_per_scene, eps2d, near_plane
         )
         ctx.save_for_backward(means, covars, viewmats, Ks, radii, conics)
         ctx.width = width
         ctx.height = height
+        ctx.cameras_per_scene = cameras_per_scene
 
         return radii, means2d, depths, conics
 
@@ -453,6 +473,7 @@ class _Projection(torch.autograd.Function):
         means, covars, viewmats, Ks, radii, conics = ctx.saved_tensors
         width = ctx.width
         height = ctx.height
+        cameras_per_scene = ctx.cameras_per_scene
         v_means, v_covars, v_viewmats = _make_lazy_cuda_func("projection_bwd")(
             means,
             covars,
@@ -460,6 +481,7 @@ class _Projection(torch.autograd.Function):
             Ks,
             width,
             height,
+            cameras_per_scene,
             radii,
             conics,
             v_means2d.contiguous(),
@@ -473,7 +495,7 @@ class _Projection(torch.autograd.Function):
             v_covars = None
         if not ctx.needs_input_grad[2]:
             v_viewmats = None
-        return v_means, v_covars, v_viewmats, None, None, None, None, None
+        return v_means, v_covars, v_viewmats, None, None, None, None, None, None
 
 
 class _RasterizeToPixels(torch.autograd.Function):
@@ -485,12 +507,13 @@ class _RasterizeToPixels(torch.autograd.Function):
         means2d: Tensor,  # [C, N, 2]
         conics: Tensor,  # [C, N, 3]
         colors: Tensor,  # [C, N, 3]
-        opacities: Tensor,  # [N]
+        opacities: Tensor,  # [S, N]
         width: int,
         height: int,
         tile_size: int,
         isect_offsets: Tensor,  # [C, tile_height, tile_width]
         gauss_ids: Tensor,  # [n_isects]
+        cameras_per_scene: int, # S
     ) -> Tuple[Tensor, Tensor]:
         render_colors, render_alphas, last_ids = _make_lazy_cuda_func(
             "rasterize_to_pixels_fwd"
@@ -504,6 +527,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             tile_size,
             isect_offsets,
             gauss_ids,
+            cameras_per_scene,
         )
 
         ctx.save_for_backward(
@@ -519,6 +543,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         ctx.width = width
         ctx.height = height
         ctx.tile_size = tile_size
+        ctx.cameras_per_scene = cameras_per_scene
 
         # double to float
         render_alphas = render_alphas.float()
@@ -543,6 +568,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         width = ctx.width
         height = ctx.height
         tile_size = ctx.tile_size
+        cameras_per_scene = ctx.cameras_per_scene
 
         (
             v_means2d,
@@ -559,6 +585,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             tile_size,
             isect_offsets,
             gauss_ids,
+            cameras_per_scene,
             render_alphas,
             last_ids,
             v_render_colors.contiguous(),
@@ -570,6 +597,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             v_conics,
             v_colors,
             v_opacities,
+            None,
             None,
             None,
             None,

@@ -27,10 +27,8 @@ def get_extensions():
     from torch.__config__ import parallel_info
     from torch.utils.cpp_extension import CUDAExtension
 
-    extensions_dir = osp.join("gsplat", "cuda", "csrc")
-    sources = glob.glob(osp.join(extensions_dir, "*.cu")) + glob.glob(
-        osp.join(extensions_dir, "*.cpp")
-    )
+    extensions_dir = osp.join("gsplat", "experimental", "cuda", "csrc")
+    sources      = glob.glob(osp.join(extensions_dir, "*.cu")) + glob.glob(osp.join(extensions_dir, "*.cpp"))
     # sources = [
     #     osp.join(extensions_dir, "ext.cpp"),
     #     osp.join(extensions_dir, "rasterize.cu"),
@@ -54,9 +52,9 @@ def get_extensions():
 
     info = parallel_info()
     if (
-        "backend: OpenMP" in info
-        and "OpenMP not found" not in info
-        and sys.platform != "darwin"
+            "backend: OpenMP" in info
+            and "OpenMP not found" not in info
+            and sys.platform != "darwin"
     ):
         extra_compile_args["cxx"] += ["-DAT_PARALLEL_OPENMP"]
         if sys.platform == "win32":
@@ -90,7 +88,7 @@ def get_extensions():
     extension = CUDAExtension(
         f"gsplat.csrc",
         sources,
-        include_dirs=[osp.join(extensions_dir, "third_party", "glm")],
+        include_dirs=[extensions_dir, osp.join(extensions_dir, "third_party", "glm")],
         define_macros=define_macros,
         undef_macros=undef_macros,
         extra_compile_args=extra_compile_args,

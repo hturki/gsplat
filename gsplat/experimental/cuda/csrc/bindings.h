@@ -69,20 +69,20 @@ world_to_cam_bwd_tensor(const torch::Tensor &means,                    // [N, 3]
                         const bool viewmats_requires_grad);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-projection_fwd_tensor(const torch::Tensor &means,    // [N, 3]
-                      const torch::Tensor &covars,   // [N, 6]
+projection_fwd_tensor(const torch::Tensor &means,    // [S, N, 3]
+                      const torch::Tensor &covars,   // [S, N, 6]
                       const torch::Tensor &viewmats, // [C, 4, 4]
                       const torch::Tensor &Ks,       // [C, 3, 3]
-                      const int image_width, const int image_height, const float eps2d,
+                      const int image_width, const int image_height, const int cameras_per_scene, const float eps2d,
                       const float near_plane);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> projection_bwd_tensor(
     // fwd inputs
-    const torch::Tensor &means,    // [N, 3]
-    const torch::Tensor &covars,   // [N, 6]
+    const torch::Tensor &means,    // [S, N, 3]
+    const torch::Tensor &covars,   // [S, N, 6]
     const torch::Tensor &viewmats, // [C, 4, 4]
     const torch::Tensor &Ks,       // [C, 3, 3]
-    const int image_width, const int image_height,
+    const int image_width, const int image_height, const int cameras_per_scene,
     // fwd outputs
     const torch::Tensor &radii,  // [C, N]
     const torch::Tensor &conics, // [C, N, 3]
@@ -108,12 +108,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_fwd_
     const torch::Tensor &means2d,   // [C, N, 2]
     const torch::Tensor &conics,    // [C, N, 3]
     const torch::Tensor &colors,    // [C, N, 3]
-    const torch::Tensor &opacities, // [N]
+    const torch::Tensor &opacities, // [S, N]
     // image size
     const int image_width, const int image_height, const int tile_size,
     // intersections
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
-    const torch::Tensor &gauss_ids     // [n_isects]
+    const torch::Tensor &gauss_ids,     // [n_isects]
+    const int cameras_per_scene // S
 );
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -122,12 +123,13 @@ rasterize_to_pixels_bwd_tensor(
     const torch::Tensor &means2d,   // [C, N, 2]
     const torch::Tensor &conics,    // [C, N, 3]
     const torch::Tensor &colors,    // [C, N, 3]
-    const torch::Tensor &opacities, // [N]
+    const torch::Tensor &opacities, // [S, N]
     // image size
     const int image_width, const int image_height, const int tile_size,
     // intersections
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
     const torch::Tensor &gauss_ids,    // [n_isects]
+    const int cameras_per_scene, // S
     // forward outputs
     const torch::Tensor &render_alphas, // [C, image_height, image_width, 1]
     const torch::Tensor &last_ids,      // [C, image_height, image_width]

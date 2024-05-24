@@ -872,12 +872,14 @@ inline __device__ void inverse_vjp(const T Minv, const T v_Minv, T &v_M) {
 }
 
 __global__ void projection_fwd_kernel(const int C, const int N,
-                                      const float *__restrict__ means,    // [N, 3]
-                                      const float *__restrict__ covars,   // [N, 6]
+                                      const float *__restrict__ means,    // [S, N, 3]
+                                      const float *__restrict__ covars,   // [S, N, 6]
                                       const float *__restrict__ viewmats, // [C, 4, 4]
                                       const float *__restrict__ Ks,       // [C, 3, 3]
                                       const int32_t image_width,
-                                      const int32_t image_height, const float eps2d,
+                                      const int32_t image_height,
+                                      const int32_t cameras_per_scene,
+                                      const float eps2d,
                                       const float near_plane,
                                       // outputs
                                       int32_t *__restrict__ radii, // [C, N]
@@ -892,10 +894,11 @@ __global__ void projection_fwd_kernel(const int C, const int N,
     }
     const int cid = idx / N; // camera id
     const int gid = idx % N; // gaussian id
+    const int sid = cid / cameras_per_scene; // scene id
 
     // shift pointers to the current camera and gaussian
-    means += gid * 3;
-    covars += gid * 6;
+    means += ((sid * N * 3) + gid * 3);
+    covars += ((sid * N * 6) + gid * 6);
     viewmats += cid * 16;
     Ks += cid * 9;
 
@@ -967,11 +970,11 @@ __global__ void projection_fwd_kernel(const int C, const int N,
 __global__ void projection_bwd_kernel(
     // fwd inputs
     const int C, const int N,
-    const float *__restrict__ means,    // [N, 3]
-    const float *__restrict__ covars,   // [N, 6]
+    const float *__restrict__ means,    // [S, N, 3]
+    const float *__restrict__ covars,   // [S, N, 6]
     const float *__restrict__ viewmats, // [C, 4, 4]
     const float *__restrict__ Ks,       // [C, 3, 3]
-    const int32_t image_width, const int32_t image_height,
+    const int32_t image_width, const int32_t image_height, const int32_t cameras_per_scene,
     // fwd outputs
     const int32_t *__restrict__ radii, // [C, N]
     const float *__restrict__ conics,  // [C, N, 3]
@@ -980,8 +983,8 @@ __global__ void projection_bwd_kernel(
     const float *__restrict__ v_depths,  // [C, N]
     const float *__restrict__ v_conics,  // [C, N, 3]
     // grad inputs
-    float *__restrict__ v_means,   // [N, 3]
-    float *__restrict__ v_covars,  // [N, 6]
+    float *__restrict__ v_means,   // [S, N, 3]
+    float *__restrict__ v_covars,  // [S, N, 6]
     float *__restrict__ v_viewmats // [C, 4, 4] (optional as it can be very slow)
 ) {
     // parallelize over C * N.
@@ -991,10 +994,11 @@ __global__ void projection_bwd_kernel(
     }
     const int cid = idx / N; // camera id
     const int gid = idx % N; // gaussian id
+    const int sid = cid / cameras_per_scene; // scene id
 
     // shift pointers to the current camera and gaussian
-    means += gid * 3;
-    covars += gid * 6;
+    means += ((sid * N * 3) + gid * 3);
+    covars += ((sid * N * 6) + gid * 6);
     viewmats += cid * 16;
     Ks += cid * 9;
 
@@ -1051,7 +1055,7 @@ __global__ void projection_bwd_kernel(
     if (v_means != nullptr) {
         warpSum(v_mean, warp_group_g);
         if (warp_group_g.thread_rank() == 0) {
-            v_means += gid * 3;
+            v_means += ((sid * N * 3) + gid * 3);
 #pragma unroll 3
             for (int i = 0; i < 3; i++) {
                 atomicAdd(v_means + i, v_mean[i]);
@@ -1061,7 +1065,7 @@ __global__ void projection_bwd_kernel(
     if (v_covars != nullptr) {
         warpSum(v_covar, warp_group_g);
         if (warp_group_g.thread_rank() == 0) {
-            v_covars += gid * 6;
+            v_covars += ((sid * N * 6) + gid * 6);
             atomicAdd(v_covars, v_covar[0][0]);
             atomicAdd(v_covars + 1, v_covar[0][1] + v_covar[1][0]);
             atomicAdd(v_covars + 2, v_covar[0][2] + v_covar[2][0]);
@@ -1089,11 +1093,11 @@ __global__ void projection_bwd_kernel(
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-projection_fwd_tensor(const torch::Tensor &means,    // [N, 3]
-                      const torch::Tensor &covars,   // [N, 6]
+projection_fwd_tensor(const torch::Tensor &means,    // [S, N, 3]
+                      const torch::Tensor &covars,   // [S, N, 6]
                       const torch::Tensor &viewmats, // [C, 4, 4]
                       const torch::Tensor &Ks,       // [C, 3, 3]
-                      const int image_width, const int image_height, const float eps2d,
+                      const int image_width, const int image_height, const int cameras_per_scene, const float eps2d,
                       const float near_plane) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
@@ -1101,7 +1105,7 @@ projection_fwd_tensor(const torch::Tensor &means,    // [N, 3]
     CHECK_INPUT(viewmats);
     CHECK_INPUT(Ks);
 
-    int N = means.size(0);    // number of gaussians
+    int N = means.size(1);    // number of gaussians
     int C = viewmats.size(0); // number of cameras
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
 
@@ -1113,7 +1117,7 @@ projection_fwd_tensor(const torch::Tensor &means,    // [N, 3]
         projection_fwd_kernel<<<(C * N + N_THREADS - 1) / N_THREADS, N_THREADS, 0,
                                 stream>>>(
             C, N, means.data_ptr<float>(), covars.data_ptr<float>(),
-            viewmats.data_ptr<float>(), Ks.data_ptr<float>(), image_width, image_height,
+            viewmats.data_ptr<float>(), Ks.data_ptr<float>(), image_width, image_height, cameras_per_scene,
             eps2d, near_plane, radii.data_ptr<int32_t>(), means2d.data_ptr<float>(),
             depths.data_ptr<float>(), conics.data_ptr<float>());
     }
@@ -1122,11 +1126,11 @@ projection_fwd_tensor(const torch::Tensor &means,    // [N, 3]
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> projection_bwd_tensor(
     // fwd inputs
-    const torch::Tensor &means,    // [N, 3]
-    const torch::Tensor &covars,   // [N, 6]
+    const torch::Tensor &means,    // [S, N, 3]
+    const torch::Tensor &covars,   // [S, N, 6]
     const torch::Tensor &viewmats, // [C, 4, 4]
     const torch::Tensor &Ks,       // [C, 3, 3]
-    const int image_width, const int image_height,
+    const int image_width, const int image_height, const int cameras_per_scene,
     // fwd outputs
     const torch::Tensor &radii,  // [C, N]
     const torch::Tensor &conics, // [C, N, 3]
@@ -1146,7 +1150,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> projection_bwd_tensor(
     CHECK_INPUT(v_depths);
     CHECK_INPUT(v_conics);
 
-    int N = means.size(0);    // number of gaussians
+    int N = means.size(1);    // number of gaussians
     int C = viewmats.size(0); // number of cameras
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
 
@@ -1160,7 +1164,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> projection_bwd_tensor(
         projection_bwd_kernel<<<(C * N + N_THREADS - 1) / N_THREADS, N_THREADS, 0,
                                 stream>>>(
             C, N, means.data_ptr<float>(), covars.data_ptr<float>(),
-            viewmats.data_ptr<float>(), Ks.data_ptr<float>(), image_width, image_height,
+            viewmats.data_ptr<float>(), Ks.data_ptr<float>(), image_width, image_height, cameras_per_scene,
             radii.data_ptr<int32_t>(), conics.data_ptr<float>(),
             v_means2d.data_ptr<float>(), v_depths.data_ptr<float>(),
             v_conics.data_ptr<float>(), v_means.data_ptr<float>(),
