@@ -52,10 +52,216 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization, RasterizeMode
-from gsplat.cuda._wrapper import CameraModel
+from gsplat.cuda._wrapper import CameraModel, RollingShutterType
+from gsplat.cuda._math import _quat_slerp, _quat_to_rotmat, _rotmat_to_quat
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
+
+NCORE_LIDAR_NEAR_PLANE_M = 0.2
+NCORE_LIDAR_FAR_PLANE_M = 1e10
+NCORE_LIDAR_RAY_DIRECTION_SCALE = 0.002
+NCORE_LIDAR_RENDER_MODE: Literal["d"] = "d"
+
+
+def _clamp_prob_preserve_grad(prob: Tensor, eps: float = 1e-6) -> Tensor:
+    clipped = prob.clamp(eps, 1.0 - eps)
+    return prob + (clipped - prob).detach()
+
+
+def _binary_cross_entropy_mean(input: Tensor, target: Tensor) -> Tensor:
+    target = target.to(dtype=input.dtype)
+    return F.binary_cross_entropy(input, target, reduction="mean")
+
+
+def _mean_square_error(input: Tensor, target: Tensor) -> Tensor:
+    target = target.to(dtype=input.dtype)
+    return (input - target).square().mean()
+
+
+def _lidar_raydrop_probability(raydrop_logits: Tensor) -> Tensor:
+    return torch.softmax(raydrop_logits, dim=-1)[..., 0]
+
+
+def _interpolate_sensor_to_scene_mid(start: Tensor, end: Tensor) -> Tensor:
+    """Use a midpoint projection pose plus END pose for rolling interpolation."""
+    q_start = _rotmat_to_quat(start[..., :3, :3])
+    q_end = _rotmat_to_quat(end[..., :3, :3])
+    t = torch.full(q_start.shape[:-1], 0.5, dtype=start.dtype, device=start.device)
+    q_mid = _quat_slerp(q_start, q_end, t)
+    mid = start.clone()
+    mid[..., :3, :3] = _quat_to_rotmat(q_mid)
+    mid[..., :3, 3] = 0.5 * (start[..., :3, 3] + end[..., :3, 3])
+    return mid
+
+
+@dataclass
+class NCoreLidarBatch:
+    ranges_gt: Tensor
+    intensities_gt: Tensor
+    return_mask: Tensor
+    sensor_to_scenes_start: Tensor
+    sensor_to_scenes_end: Tensor
+
+
+def _ncore_lidar_batch_to_device(
+    data: Dict[str, Tensor],
+    device: Union[str, torch.device],
+) -> NCoreLidarBatch:
+    ranges_gt = data["lidar_ranges"].to(device)
+    intensities_gt = data["lidar_intensities"].to(device)
+    return_mask = data["lidar_return_mask"].to(device)
+    sensor_to_scene = data["lidar_sensor_to_scene"]
+    sensor_to_scenes_start = data.get(
+        "lidar_sensor_to_scene_start", sensor_to_scene
+    ).to(device)
+    sensor_to_scenes_end = data.get(
+        "lidar_sensor_to_scene_end", sensor_to_scene
+    ).to(device)
+    return NCoreLidarBatch(
+        ranges_gt=ranges_gt,
+        intensities_gt=intensities_gt,
+        return_mask=return_mask,
+        sensor_to_scenes_start=sensor_to_scenes_start,
+        sensor_to_scenes_end=sensor_to_scenes_end,
+    )
+
+
+@dataclass
+class NCoreLidarLossTerms:
+    distance: Tensor
+    intensity: Tensor
+    raydrop: Tensor
+
+
+def _masked_mean(value: Tensor, mask: Tensor) -> Tensor:
+    weight = mask.to(dtype=value.dtype)
+    return (value * weight).sum() / weight.sum().clamp_min(1.0)
+
+
+def _ncore_lidar_range_scale(parser: object) -> float:
+    scale = float(getattr(parser, "normalization_scale", 1.0))
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"Invalid NCore normalization scale: {scale}")
+    return scale
+
+
+def _require_lidar_extra(
+    intensities: Optional[Tensor],
+    raydrop_logits: Optional[Tensor],
+) -> Tuple[Tensor, Tensor]:
+    if intensities is None or raydrop_logits is None:
+        raise RuntimeError("Expected intensity and raydrop LiDAR extra signals.")
+    return intensities, raydrop_logits
+
+
+def _ncore_lidar_training_losses(
+    ranges: Tensor,
+    intensities: Optional[Tensor],
+    raydrop_logits: Optional[Tensor],
+    batch: NCoreLidarBatch,
+    range_scale: float,
+) -> NCoreLidarLossTerms:
+    intensities, raydrop_logits = _require_lidar_extra(intensities, raydrop_logits)
+    range_valid = batch.return_mask.to(dtype=ranges.dtype)
+    return_target = batch.return_mask.to(dtype=ranges.dtype)
+
+    distance_loss = _masked_mean(
+        torch.abs(ranges - batch.ranges_gt) / range_scale,
+        range_valid,
+    )
+    intensity_loss = _masked_mean(
+        (intensities - batch.intensities_gt).square(),
+        range_valid,
+    )
+    raydrop_loss = _mean_square_error(
+        _lidar_raydrop_probability(raydrop_logits),
+        1.0 - return_target,
+    )
+    return NCoreLidarLossTerms(distance_loss, intensity_loss, raydrop_loss)
+
+
+def _ncore_lidar_eval_metrics(
+    ranges: Tensor,
+    alphas: Tensor,
+    intensities: Optional[Tensor],
+    raydrop_logits: Optional[Tensor],
+    batch: NCoreLidarBatch,
+    range_scale: float,
+) -> Dict[str, Tensor]:
+    intensities, raydrop_logits = _require_lidar_extra(intensities, raydrop_logits)
+    range_valid = batch.return_mask.to(dtype=ranges.dtype)
+    return_target = batch.return_mask.to(dtype=ranges.dtype)
+    return_count = range_valid.sum().clamp_min(1.0)
+    ray_count = return_target.new_tensor(return_target.numel()).clamp_min(1.0)
+
+    delta = (ranges - batch.ranges_gt) * range_valid
+    mae_scene = delta.abs().sum() / return_count
+    rmse_scene = torch.sqrt((delta.square().sum() / return_count).clamp_min(0.0))
+    intensity_delta = (intensities - batch.intensities_gt) * range_valid
+    intensity_rmse = torch.sqrt(
+        (intensity_delta.square().sum() / return_count).clamp_min(0.0)
+    )
+
+    raydrop_target = 1.0 - return_target
+    raydrop_prob = _lidar_raydrop_probability(raydrop_logits)
+    return_prob = _clamp_prob_preserve_grad(1.0 - raydrop_prob)
+    raydrop_loss = _mean_square_error(raydrop_prob, raydrop_target)
+
+    return_bool = batch.return_mask.bool()
+    pred_return = return_prob >= 0.5
+    empty_bool = ~return_bool
+    empty_count = empty_bool.to(dtype=ranges.dtype).sum()
+
+    true_positive = (pred_return & return_bool).to(ranges.dtype).sum()
+    false_positive = (pred_return & empty_bool).to(ranges.dtype).sum()
+    false_negative = (~pred_return & return_bool).to(ranges.dtype).sum()
+    true_negative = (~pred_return & empty_bool).to(ranges.dtype).sum()
+    return_accuracy = (
+        (pred_return == return_bool).to(ranges.dtype).sum() / ray_count
+    )
+
+    alpha_prob = _clamp_prob_preserve_grad(alphas[..., 0])
+    empty_weight = empty_bool.to(dtype=ranges.dtype)
+    metrics = {
+        "ncore_lidar_mae_scene": mae_scene,
+        "ncore_lidar_rmse_scene": rmse_scene,
+        "ncore_lidar_mae_m": mae_scene / range_scale,
+        "ncore_lidar_rmse_m": rmse_scene / range_scale,
+        "ncore_lidar_intensity_mae": intensity_delta.abs().sum() / return_count,
+        "ncore_lidar_intensity_rmse": intensity_rmse,
+        "ncore_lidar_raydrop_bce": _binary_cross_entropy_mean(
+            return_prob, return_target
+        ),
+        "ncore_lidar_raydrop_mse": _mean_square_error(raydrop_prob, raydrop_target),
+        "ncore_lidar_raydrop_loss": raydrop_loss,
+        "ncore_lidar_return_accuracy": return_accuracy,
+        "ncore_lidar_return_precision": true_positive
+        / (true_positive + false_positive).clamp_min(1.0),
+        "ncore_lidar_return_recall": true_positive
+        / (true_positive + false_negative).clamp_min(1.0),
+        "ncore_lidar_raydrop_accuracy": return_accuracy,
+        "ncore_lidar_raydrop_precision": true_negative
+        / (true_negative + false_negative).clamp_min(1.0),
+        "ncore_lidar_raydrop_recall": true_negative
+        / (true_negative + false_positive).clamp_min(1.0),
+        "ncore_lidar_raydrop_iou": true_negative
+        / (true_negative + false_negative + false_positive).clamp_min(1.0),
+        "ncore_lidar_false_return_fraction": false_positive
+        / empty_count.clamp_min(1.0),
+        "ncore_lidar_missed_return_fraction": false_negative / return_count,
+        "ncore_lidar_alpha_native_mean": (alpha_prob * range_valid).sum()
+        / return_count,
+        "ncore_lidar_alpha_empty_mean": (alpha_prob * empty_weight).sum()
+        / empty_count.clamp_min(1.0),
+        "ncore_lidar_raydrop_native_mean": (raydrop_prob * range_valid).sum()
+        / return_count,
+        "ncore_lidar_raydrop_empty_mean": (raydrop_prob * empty_weight).sum()
+        / empty_count.clamp_min(1.0),
+        "ncore_lidar_return_rays": range_valid.sum(),
+        "ncore_lidar_grid_rays": ray_count,
+    }
+    return metrics
 
 
 @dataclass
@@ -108,7 +314,6 @@ class Config:
     ncore_poses_component_group: str = "default"
     ncore_intrinsics_component_group: str = "default"
     ncore_masks_component_group: str = "default"
-
     # Port for the viewer server
     port: int = 8080
 
@@ -151,7 +356,6 @@ class Config:
     near_plane: float = 0.01
     # Far plane clipping distance
     far_plane: float = 1e10
-
     # Strategy for GS densification
     strategy: Union[DefaultStrategy, MCMCStrategy] = field(
         default_factory=DefaultStrategy
@@ -225,6 +429,15 @@ class Config:
     depth_loss: bool = False
     # Weight for depth loss
     depth_lambda: float = 1e-2
+    # Enable native NCore lidar ray supervision using the lidar camera model.
+    ncore_lidar_loss: bool = False
+    # Weight for native NCore lidar accumulated hit-distance loss.
+    ncore_lidar_lambda: float = 5e-3
+    # Weight for native NCore lidar intensity loss.
+    ncore_lidar_intensity_lambda: float = 1e-1
+    # Weight for native NCore lidar return/raydrop loss.
+    ncore_lidar_raydrop_lambda: float = 5e-2
+    ncore_lidar_extra_signal_lr: float = 1e-2
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -281,6 +494,7 @@ def create_splats_with_optimizers(
     visible_adam: bool = False,
     batch_size: int = 1,
     feature_dim: Optional[int] = None,
+    lidar_extra_signal_lr: Optional[float] = None,
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
@@ -315,6 +529,16 @@ def create_splats_with_optimizers(
         ("quats", torch.nn.Parameter(quats), quats_lr),
         ("opacities", torch.nn.Parameter(opacities), opacities_lr),
     ]
+
+    if lidar_extra_signal_lr is not None:
+        lidar_extra_signal = torch.rand((N, 3))
+        params.append(
+            (
+                "lidar_extra_signal",
+                torch.nn.Parameter(lidar_extra_signal),
+                lidar_extra_signal_lr,
+            )
+        )
 
     if feature_dim is None:
         # color is SH coefficients.
@@ -368,6 +592,7 @@ class Runner:
         self.local_rank = local_rank
         self.world_size = world_size
         self.device = f"cuda:{local_rank}"
+        self.ncore_lidar_coeffs = None
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
@@ -387,8 +612,13 @@ class Runner:
 
         # Load data: Training data should contain initial points and colors.
         if cfg.data_type == "ncore":
-            from datasets.ncore import NCoreDataset, NCoreParser
+            from datasets.ncore import (
+                NCoreDataset,
+                NCoreParser,
+                build_gsplat_lidar_coeffs_from_sensor,
+            )
 
+            load_lidar_points = cfg.normalize_world_space or cfg.init_type != "random"
             self.parser = NCoreParser(
                 meta_json_path=cfg.data_dir,
                 factor=1.0 / cfg.data_factor if cfg.data_factor > 1 else 1.0,
@@ -398,14 +628,28 @@ class Runner:
                 seek_offset_sec=cfg.ncore_seek_offset_sec,
                 duration_sec=cfg.ncore_duration_sec,
                 max_lidar_points=cfg.ncore_max_lidar_points,
+                load_lidar_points=load_lidar_points,
                 lidar_color_generic_data_name=cfg.ncore_lidar_color_generic_data_name,
                 poses_component_group=cfg.ncore_poses_component_group,
                 intrinsics_component_group=cfg.ncore_intrinsics_component_group,
                 masks_component_group=cfg.ncore_masks_component_group,
                 normalize_world_space=cfg.normalize_world_space,
             )
-            self.trainset = NCoreDataset(self.parser, split="train")
-            self.valset = NCoreDataset(self.parser, split="val")
+            if cfg.depth_loss:
+                raise ValueError(
+                    "depth_loss is not supported for NCore. "
+                    "Use ncore_lidar_loss for lidar supervision."
+                )
+            self.trainset = NCoreDataset(
+                self.parser,
+                split="train",
+                load_lidar=cfg.ncore_lidar_loss,
+            )
+            self.valset = NCoreDataset(
+                self.parser,
+                split="val",
+                load_lidar=cfg.ncore_lidar_loss,
+            )
             self.ncore_camera_data = [
                 self.parser.camera_render_data[cam_id]
                 for cam_id in self.parser.camera_ids
@@ -416,6 +660,23 @@ class Runner:
             ):
                 print(
                     "[NCore] Warning: FTheta cameras detected; pass --with-eval3d True for correct results."
+                )
+            if cfg.ncore_lidar_loss:
+                if not cfg.with_ut or not cfg.with_eval3d:
+                    raise ValueError(
+                        "ncore_lidar_loss requires with_ut=True and with_eval3d=True."
+                    )
+                if not self.parser.lidar_ids:
+                    raise ValueError(
+                        "ncore_lidar_loss requires at least one lidar sensor."
+                    )
+                sequence_loader = self.parser._open_sequence_loader(
+                    self.parser.sequence_meta_file_path
+                )
+                lidar_sensor = sequence_loader.get_lidar_sensor(self.parser.lidar_ids[0])
+                self.ncore_lidar_coeffs = build_gsplat_lidar_coeffs_from_sensor(
+                    lidar_sensor,
+                    device=torch.device(self.device),
                 )
         else:
             self.parser = Parser(
@@ -453,6 +714,8 @@ class Runner:
             raise ValueError(
                 f"PPISP post-processing requires MCMCStrategy at the moment."
             )
+        if cfg.ncore_lidar_loss and cfg.data_type != "ncore":
+            raise ValueError("ncore_lidar_loss is only supported for data_type='ncore'.")
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
@@ -475,6 +738,9 @@ class Runner:
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
             feature_dim=feature_dim,
+            lidar_extra_signal_lr=(
+                cfg.ncore_lidar_extra_signal_lr if cfg.ncore_lidar_loss else None
+            ),
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
@@ -761,6 +1027,88 @@ class Runner:
 
         return render_colors, render_alphas, info
 
+    def rasterize_lidar(
+        self,
+        lidar_sensor_to_scenes_start: Tensor,
+        lidar_sensor_to_scenes_end: Optional[Tensor] = None,
+        return_lidar_extra: bool = False,
+    ) -> Tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
+        if self.ncore_lidar_coeffs is None:
+            raise ValueError("Native NCore lidar coefficients are not initialized.")
+
+        viewmats = torch.linalg.inv(lidar_sensor_to_scenes_start)
+        viewmats_rs = None
+        rolling_shutter = RollingShutterType.GLOBAL
+        if lidar_sensor_to_scenes_end is not None:
+            lidar_sensor_to_scenes_mid = _interpolate_sensor_to_scene_mid(
+                lidar_sensor_to_scenes_start, lidar_sensor_to_scenes_end
+            )
+            viewmats = torch.linalg.inv(lidar_sensor_to_scenes_mid)
+            viewmats_rs = torch.linalg.inv(lidar_sensor_to_scenes_end)
+            # Spinning lidar timing is supplied by the lidar model itself; using a
+            # non-GLOBAL shutter here enables interpolation between START/END poses.
+            rolling_shutter = RollingShutterType.ROLLING_LEFT_TO_RIGHT
+
+        means = self.splats["means"]
+        quats = self.splats["quats"]
+        scales = torch.exp(self.splats["scales"])
+        opacities = torch.sigmoid(self.splats["opacities"])
+        extra_signals = None
+        if return_lidar_extra:
+            if "lidar_extra_signal" not in self.splats:
+                raise ValueError("LiDAR extra signals were requested but lidar_extra_signal is missing.")
+            extra_signals = self.splats["lidar_extra_signal"]
+        Ks = (
+            torch.eye(3, device=means.device, dtype=torch.float32)
+            .unsqueeze(0)
+            .expand(lidar_sensor_to_scenes_start.shape[0], -1, -1)
+        )
+        lidar_range_scale = float(getattr(self.parser, "normalization_scale", 1.0))
+        lidar_near_plane = NCORE_LIDAR_NEAR_PLANE_M * lidar_range_scale
+        lidar_far_plane = NCORE_LIDAR_FAR_PLANE_M * lidar_range_scale
+        renders, alphas, info = rasterization(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            colors=None,
+            viewmats=viewmats,
+            viewmats_rs=viewmats_rs,
+            Ks=Ks,
+            width=self.ncore_lidar_coeffs.n_columns,
+            height=self.ncore_lidar_coeffs.n_rows,
+            near_plane=lidar_near_plane,
+            far_plane=lidar_far_plane,
+            packed=self.cfg.packed,
+            absgrad=False,
+            sparse_grad=False,
+            rasterize_mode="classic",
+            distributed=self.world_size > 1,
+            camera_model="lidar",
+            with_ut=self.cfg.with_ut,
+            with_eval3d=self.cfg.with_eval3d,
+            lidar_coeffs=self.ncore_lidar_coeffs,
+            extra_signals=extra_signals,
+            render_mode=NCORE_LIDAR_RENDER_MODE,
+            rolling_shutter=rolling_shutter,
+            # LiDAR is spherical/360-degree; z-depth ordering culls valid side/back returns.
+            global_z_order=False,
+            ray_direction_scale=NCORE_LIDAR_RAY_DIRECTION_SCALE,
+        )
+        intensities = None
+        raydrop_logits = None
+        if return_lidar_extra:
+            rendered_extra = info.get("render_extra_signals")
+            if rendered_extra is None:
+                raise RuntimeError("Expected render_extra_signals for lidar extra signals.")
+            if rendered_extra.shape[-1] < 3:
+                raise RuntimeError(
+                    "Expected lidar_extra_signal to contain intensity plus two raydrop logits."
+                )
+            intensities = rendered_extra[..., 0]
+            raydrop_logits = rendered_extra[..., 1:3]
+        return renders, alphas, intensities, raydrop_logits
+
     def train(self):
         cfg = self.cfg
         device = self.device
@@ -862,6 +1210,8 @@ class Runner:
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
+            if cfg.ncore_lidar_loss:
+                lidar_batch = _ncore_lidar_batch_to_device(data, device)
 
             height, width = pixels.shape[1:3]
 
@@ -924,6 +1274,8 @@ class Runner:
                 pixels_ssim.permute(0, 3, 1, 2),
                 padding="valid",
             )
+            # fused_ssim may return a per-image tensor; training expects a scalar loss.
+            ssimloss = ssimloss.mean()
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
             if cfg.depth_loss:
                 # query depths from depth map
@@ -944,6 +1296,30 @@ class Runner:
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
+            if cfg.ncore_lidar_loss:
+                (
+                    lidar_renders,
+                    _,
+                    lidar_intensities,
+                    lidar_raydrop_logits,
+                ) = self.rasterize_lidar(
+                    lidar_batch.sensor_to_scenes_start,
+                    lidar_batch.sensor_to_scenes_end,
+                    return_lidar_extra=True,
+                )
+                lidar_losses = _ncore_lidar_training_losses(
+                    lidar_renders[..., 0],
+                    lidar_intensities,
+                    lidar_raydrop_logits,
+                    lidar_batch,
+                    _ncore_lidar_range_scale(self.parser),
+                )
+                lidar_loss = lidar_losses.distance
+                lidar_intensity_loss = lidar_losses.intensity
+                lidar_raydrop_loss = lidar_losses.raydrop
+                loss += lidar_loss * cfg.ncore_lidar_lambda
+                loss += lidar_intensity_loss * cfg.ncore_lidar_intensity_lambda
+                loss += lidar_raydrop_loss * cfg.ncore_lidar_raydrop_lambda
             if cfg.post_processing == "bilateral_grid":
                 post_processing_reg_loss = 10 * total_variation_loss(
                     self.post_processing_module.grids
@@ -966,6 +1342,10 @@ class Runner:
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
+            if cfg.ncore_lidar_loss:
+                desc += f"lidar loss={lidar_loss.item():.6f}| "
+                desc += f"intensity loss={lidar_intensity_loss.item():.6f}| "
+                desc += f"raydrop loss={lidar_raydrop_loss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
@@ -990,6 +1370,16 @@ class Runner:
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                if cfg.ncore_lidar_loss:
+                    self.writer.add_scalar("train/lidarloss", lidar_loss.item(), step)
+                    self.writer.add_scalar(
+                        "train/lidar_intensity_loss",
+                        lidar_intensity_loss.item(),
+                        step,
+                    )
+                    self.writer.add_scalar(
+                        "train/lidar_raydrop_loss", lidar_raydrop_loss.item(), step
+                    )
                 if cfg.post_processing is not None:
                     self.writer.add_scalar(
                         "train/post_processing_reg_loss",
@@ -1017,6 +1407,23 @@ class Runner:
                 ) as f:
                     json.dump(stats, f)
                 data = {"step": step, "splats": self.splats.state_dict()}
+                if cfg.data_type == "ncore":
+                    data["ncore_normalization"] = {
+                        "sequence_id": self.parser.sequence_id,
+                        "normalize_world_space": bool(
+                            self.parser.normalize_world_space
+                        ),
+                        "T_world_to_scene_world": torch.from_numpy(
+                            self.parser.T_world_to_scene_world.astype(np.float32)
+                        ),
+                        "world_global_to_scene_matrix": torch.from_numpy(
+                            self.parser.world_global_to_scene.matrix.astype(np.float32)
+                        ),
+                        "normalization_scale": float(self.parser.normalization_scale),
+                        "transform": torch.from_numpy(
+                            self.parser.transform.astype(np.float32)
+                        ),
+                    }
                 if cfg.pose_opt:
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
@@ -1179,6 +1586,9 @@ class Runner:
             # Exposure metadata is available for any image with EXIF data (train or val)
             exposure = data["exposure"].to(device) if "exposure" in data else None
 
+            if cfg.ncore_lidar_loss:
+                lidar_batch = _ncore_lidar_batch_to_device(data, device)
+
             torch.cuda.synchronize()
             tic = time.time()
             colors, _, _ = self.rasterize_splats(
@@ -1199,6 +1609,26 @@ class Runner:
 
             colors = torch.clamp(colors, 0.0, 1.0)
             canvas_list = [pixels, colors]
+
+            if cfg.ncore_lidar_loss:
+                (
+                    lidar_renders,
+                    lidar_alphas,
+                    lidar_intensities,
+                    lidar_raydrop_logits,
+                ) = self.rasterize_lidar(
+                    lidar_batch.sensor_to_scenes_start,
+                    lidar_batch.sensor_to_scenes_end,
+                    return_lidar_extra=True,
+                )
+                lidar_metrics = _ncore_lidar_eval_metrics(
+                    lidar_renders[..., 0],
+                    lidar_alphas,
+                    lidar_intensities,
+                    lidar_raydrop_logits,
+                    lidar_batch,
+                    _ncore_lidar_range_scale(self.parser),
+                )
 
             if world_rank == 0:
                 # write images
@@ -1224,6 +1654,9 @@ class Runner:
                     metrics["cc_psnr"].append(self.psnr(cc_colors_p, pixels_p))
                     metrics["cc_ssim"].append(self.ssim(cc_colors_p, pixels_p))
                     metrics["cc_lpips"].append(self.lpips(cc_colors_p, pixels_p))
+                if cfg.ncore_lidar_loss:
+                    for name, value in lidar_metrics.items():
+                        metrics[name].append(value.detach())
 
         if world_rank == 0:
             ellipse_time /= len(valloader)
@@ -1491,7 +1924,13 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             for file in cfg.ckpt
         ]
         for k in runner.splats.keys():
-            runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+            tensors = []
+            for ckpt in ckpts:
+                if k in ckpt["splats"]:
+                    tensors.append(ckpt["splats"][k])
+                else:
+                    raise KeyError(f"Checkpoint {cfg.ckpt} is missing required splat parameter {k!r}.")
+            runner.splats[k].data = torch.cat(tensors)
         if runner.post_processing_module is not None:
             pp_state = ckpts[0].get("post_processing")
             if pp_state is not None:

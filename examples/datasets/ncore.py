@@ -27,8 +27,14 @@ from scipy import ndimage
 import ncore.data
 import ncore.data.v4
 import ncore.sensors
-from ncore.data import PointCloudsSourceProtocol
 
+from gsplat import (
+    RowOffsetStructuredSpinningLidarModelParameters,
+    RowOffsetStructuredSpinningLidarModelParametersExt,
+    SpinningDirection,
+    compute_lidar_angles_to_columns_map,
+    compute_lidar_tiling,
+)
 from gsplat.rendering import FThetaCameraDistortionParameters, FThetaPolynomialType
 
 from .ncore_utils import FrameConversion
@@ -92,6 +98,219 @@ def _parse_optional_coeffs(coeffs: Optional[Any]) -> Optional[np.ndarray]:
     return coeffs_array
 
 
+def _get_nearest_lidar_frame_index(
+    lidar_sensor: ncore.data.LidarSensorProtocol,
+    target_timestamp_us: int,
+) -> int:
+    """Return the lidar frame nearest to the given timestamp."""
+    if hasattr(lidar_sensor, "get_closest_frame_index"):
+        return int(lidar_sensor.get_closest_frame_index(target_timestamp_us))
+
+    timestamps = np.asarray(lidar_sensor.get_frames_timestamps_us()).reshape(-1)
+    if timestamps.size == 0:
+        raise ValueError("LiDAR sensor has no timestamps.")
+    return int(np.argmin(np.abs(timestamps.astype(np.int64) - int(target_timestamp_us))))
+
+
+def _load_native_lidar_images(
+    lidar_sensor: ncore.data.LidarSensorProtocol,
+    lidar_frame_idx: int,
+    return_index: int = 0,
+    load_intensity: bool = True,
+) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
+    """Load NCore's native closest-return LiDAR labels.
+
+    One explicit return index is used for multi-return lidars rather than
+    collapsing across all returns. Distance and intensity are supervised only on
+    returned rays; raydrop is supervised on the full native ray grid.
+    """
+    distances = np.asarray(
+        lidar_sensor.get_frame_ray_bundle_return_distance_m(
+            frame_index=lidar_frame_idx,
+            return_index=return_index,
+        ),
+        dtype=np.float32,
+    ).reshape(-1)
+    intensities = None
+    if load_intensity:
+        intensities = np.asarray(
+            lidar_sensor.get_frame_ray_bundle_return_intensity(
+                lidar_frame_idx, return_index=return_index
+            ),
+            dtype=np.float32,
+        ).reshape(-1)
+    model_elements = np.asarray(
+        lidar_sensor.get_frame_ray_bundle_model_element(lidar_frame_idx)
+    )
+    if model_elements.ndim != 2 or model_elements.shape[1] < 2:
+        raise ValueError(f"Unexpected packed lidar model-element shape {model_elements.shape}")
+    if model_elements.shape[0] != distances.shape[0]:
+        raise ValueError(
+            "Closest-return lidar ray count does not match model-element count: "
+            f"{distances.shape[0]} vs {model_elements.shape[0]}"
+        )
+    if intensities is not None and model_elements.shape[0] != intensities.shape[0]:
+        raise ValueError(
+            "Closest-return lidar intensity count does not match model-element count: "
+            f"{intensities.shape[0]} vs {model_elements.shape[0]}"
+        )
+
+    model_params = _get_lidar_model_parameters(lidar_sensor)
+    n_rows = len(model_params.row_elevations_rad)
+    n_cols = len(model_params.column_azimuths_rad)
+    dense_distances = np.zeros((n_rows, n_cols), dtype=np.float32)
+    dense_intensities = (
+        np.zeros((n_rows, n_cols), dtype=np.float32)
+        if intensities is not None
+        else None
+    )
+    dense_return = np.zeros((n_rows, n_cols), dtype=bool)
+    rows = model_elements[:, 0].astype(np.int64)
+    cols = model_elements[:, 1].astype(np.int64)
+    in_bounds = (rows >= 0) & (rows < n_rows) & (cols >= 0) & (cols < n_cols)
+    if not np.all(in_bounds):
+        raise ValueError("Packed lidar model-element indices exceed model dimensions.")
+    finite_positive = np.isfinite(distances) & (distances > 0)
+    if (~finite_positive).any():
+        raise ValueError(
+            "LiDAR closest-return distances contain non-finite or non-positive "
+            f"values for {int((~finite_positive).sum())} returned rays."
+        )
+    if intensities is not None:
+        finite_intensity = np.isfinite(intensities)
+        if (~finite_intensity).any():
+            raise ValueError(
+                "LiDAR closest-return intensities contain non-finite values for "
+                f"{int((~finite_intensity).sum())} returned rays."
+            )
+        assert dense_intensities is not None
+        dense_intensities[rows[finite_intensity], cols[finite_intensity]] = (
+            intensities[finite_intensity]
+        )
+    dense_distances[rows[finite_positive], cols[finite_positive]] = distances[
+        finite_positive
+    ]
+    dense_return[rows, cols] = True
+    return dense_distances, dense_intensities, dense_return
+
+
+def _load_native_range_image(
+    lidar_sensor: ncore.data.LidarSensorProtocol,
+    lidar_frame_idx: int,
+    return_index: int = 0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Load NCore's native closest-return LiDAR range image."""
+    distances, _, dense_return = _load_native_lidar_images(
+        lidar_sensor,
+        lidar_frame_idx,
+        return_index=return_index,
+        load_intensity=False,
+    )
+    return distances, dense_return
+
+
+def _get_lidar_model_parameters(
+    lidar_sensor: ncore.data.LidarSensorProtocol,
+) -> ncore.data.RowOffsetStructuredSpinningLidarModelParameters:
+    """Return native NCore lidar model parameters instead of re-estimating them from rays."""
+    model_params = getattr(lidar_sensor, "model_parameters", None)
+    if model_params is None and hasattr(lidar_sensor, "get_lidar_model_parameters"):
+        model_params = lidar_sensor.get_lidar_model_parameters()
+    if model_params is None:
+        raise ValueError("LiDAR sensor does not expose native model parameters.")
+    if not isinstance(
+        model_params, ncore.data.RowOffsetStructuredSpinningLidarModelParameters
+    ):
+        raise TypeError(
+            f"Unsupported lidar model type: {type(model_params).__name__}. "
+            "Only RowOffsetStructuredSpinningLidarModelParameters is supported."
+        )
+    return model_params
+
+
+def build_gsplat_lidar_coeffs_from_ncore_model(
+    model_params: ncore.data.RowOffsetStructuredSpinningLidarModelParameters,
+    device: torch.device,
+    *,
+    n_bins_elevation: int = 16,
+    resolution_elevation: int = 1600,
+    densification_factor_azimuth: int = 8,
+    max_pts_per_tile: int = 256,
+) -> RowOffsetStructuredSpinningLidarModelParametersExt:
+    """Convert native NCore lidar model parameters to gsplat lidar coefficients."""
+    spinning_direction_raw = model_params.spinning_direction
+    if isinstance(spinning_direction_raw, str):
+        spinning_direction_key = spinning_direction_raw.lower()
+    else:
+        spinning_direction_key = getattr(spinning_direction_raw, "name", "").lower()
+    if spinning_direction_key in {"cw", "clockwise"}:
+        spinning_direction = SpinningDirection.CLOCKWISE
+    elif spinning_direction_key in {"ccw", "counter_clockwise", "counterclockwise"}:
+        spinning_direction = SpinningDirection.COUNTER_CLOCKWISE
+    else:
+        raise ValueError(
+            f"Unsupported lidar spinning direction: {spinning_direction_raw!r}"
+        )
+    row_elevations = torch.as_tensor(
+        np.asarray(model_params.row_elevations_rad, dtype=np.float32),
+        device=device,
+        dtype=torch.float32,
+    )
+    column_azimuths = torch.as_tensor(
+        np.asarray(model_params.column_azimuths_rad, dtype=np.float32),
+        device=device,
+        dtype=torch.float32,
+    )
+    row_offsets_np = model_params.row_azimuth_offsets_rad
+    if row_offsets_np is None:
+        row_offsets = torch.zeros_like(row_elevations)
+    else:
+        row_offsets = torch.as_tensor(
+            np.asarray(row_offsets_np, dtype=np.float32),
+            device=device,
+            dtype=torch.float32,
+        )
+
+    params = RowOffsetStructuredSpinningLidarModelParameters(
+        row_elevations_rad=row_elevations,
+        column_azimuths_rad=column_azimuths,
+        row_azimuth_offsets_rad=row_offsets,
+        spinning_frequency_hz=float(model_params.spinning_frequency_hz),
+        spinning_direction=spinning_direction,
+    )
+    angles_to_columns_map = compute_lidar_angles_to_columns_map(params)
+    tiling = compute_lidar_tiling(
+        params,
+        n_bins_elevation=n_bins_elevation,
+        max_pts_per_tile=max_pts_per_tile,
+        resolution_elevation=resolution_elevation,
+        densification_factor_azimuth=densification_factor_azimuth,
+    )
+    return RowOffsetStructuredSpinningLidarModelParametersExt(
+        params, angles_to_columns_map, tiling
+    )
+
+
+def build_gsplat_lidar_coeffs_from_sensor(
+    lidar_sensor: ncore.data.LidarSensorProtocol,
+    device: torch.device,
+    *,
+    n_bins_elevation: int = 16,
+    resolution_elevation: int = 1600,
+    densification_factor_azimuth: int = 8,
+    max_pts_per_tile: int = 256,
+) -> RowOffsetStructuredSpinningLidarModelParametersExt:
+    model_params = _get_lidar_model_parameters(lidar_sensor)
+    return build_gsplat_lidar_coeffs_from_ncore_model(
+        model_params,
+        device=device,
+        n_bins_elevation=n_bins_elevation,
+        resolution_elevation=resolution_elevation,
+        densification_factor_azimuth=densification_factor_azimuth,
+        max_pts_per_tile=max_pts_per_tile,
+    )
+
+
 # ---------------------------------------------------------------------------
 # NCoreParser
 # ---------------------------------------------------------------------------
@@ -143,6 +362,7 @@ class NCoreParser:
         n_camera_mask_dilation_iterations: int = 30,
         lidar_color_generic_data_name: str = "rgb",
         normalize_world_space: bool = False,
+        load_lidar_points: bool = True,
     ) -> None:
         self.test_every = test_every
         self.factor = factor
@@ -186,9 +406,15 @@ class NCoreParser:
         self.bounds = np.array([0.01, 1.0])
         self.extconf = {"spiral_radius_scale": 1.0, "no_factor_suffix": False}
 
-        self.points, self.points_rgb = self._load_point_clouds(
-            sequence_loader, max_lidar_points, lidar_step_frame
-        )
+        if load_lidar_points:
+            self.points, self.points_rgb = self._load_point_clouds(
+                sequence_loader, max_lidar_points, lidar_step_frame
+            )
+        else:
+            self.points = np.zeros((0, 3), dtype=np.float32)
+            self.points_rgb = np.zeros((0, 3), dtype=np.uint8)
+
+        self.transform = np.eye(4, dtype=np.float64)
 
         # Normalize the world space (orient, centre, and rescale).
         if self.normalize_world_space:
@@ -258,7 +484,7 @@ class NCoreParser:
             print(f"[NCoreParser] Auto-detected cameras: {camera_ids}")
         if not lidar_ids:
             point_clouds_source_ids = list(sequence_loader.lidar_ids) + list(
-                sequence_loader.point_clouds_ids
+                getattr(sequence_loader, "point_clouds_ids", [])
             )
 
             if len(point_clouds_source_ids) > 1:
@@ -267,7 +493,9 @@ class NCoreParser:
                     f" specification of a (subset) of sources required to avoid ambiguity: {lidar_ids}"
                 )
 
-            print(f"[NCoreParser] Auto-detected point cloud sources: {lidar_ids}")
+            print(
+                f"[NCoreParser] Auto-detected point cloud sources: {point_clouds_source_ids}"
+            )
         else:
             point_clouds_source_ids = lidar_ids
 
@@ -276,17 +504,22 @@ class NCoreParser:
         ), f"NCoreParser: some specified camera_ids {camera_ids} not found in dataset cameras {sequence_loader.camera_ids}"
 
         all_point_cloud_ids = set(sequence_loader.lidar_ids) | set(
-            sequence_loader.point_clouds_ids
+            getattr(sequence_loader, "point_clouds_ids", [])
         )
         assert all(
             pid in all_point_cloud_ids for pid in point_clouds_source_ids
         ), f"NCoreParser: some specified lidar_ids {lidar_ids} not found in dataset point cloud sources {all_point_cloud_ids}"
 
+        selected_lidar_ids = [
+            pid for pid in point_clouds_source_ids if pid in sequence_loader.lidar_ids
+        ]
         self.camera_ids: List[str] = list(camera_ids)
+        self.lidar_ids: List[str] = selected_lidar_ids
         self.point_clouds_source_ids: List[str] = list(point_clouds_source_ids)
         self.num_cameras: int = len(self.camera_ids)
 
         print(f"[NCoreParser] Using cameras: {self.camera_ids}")
+        print(f"[NCoreParser] Using lidar sensors: {self.lidar_ids}")
         print(
             f"[NCoreParser] Using point cloud sources: {self.point_clouds_source_ids}"
         )
@@ -590,6 +823,96 @@ class NCoreParser:
         T_poses_common = self.T_world_to_scene_world @ T_poses_world.reshape(-1, 4, 4)
         return self.world_global_to_scene.transform_poses(T_poses_common)
 
+    def _apply_normalization_to_poses(self, T_poses_scene: np.ndarray) -> np.ndarray:
+        """Apply the optional parser world-space normalization to scene poses."""
+        poses = T_poses_scene.reshape(-1, 4, 4)
+        if self.normalize_world_space:
+            poses = transform_cameras(self.transform, poses)
+        return poses[0] if poses.shape[0] == 1 else poses
+
+    @property
+    def normalization_scale(self) -> float:
+        """Uniform metre-to-scene scale introduced by optional world normalization."""
+        if not self.normalize_world_space:
+            return 1.0
+        transform = np.asarray(self.transform, dtype=np.float64)
+        column_scales = np.linalg.norm(transform[:3, :3], axis=0)
+        scale = float(column_scales.mean())
+        if not np.allclose(column_scales, scale, rtol=1e-4, atol=1e-6):
+            raise ValueError(
+                "Expected normalize_world_space transform to have uniform scale, "
+                f"got column scales {column_scales.tolist()}"
+            )
+        return scale
+
+    def get_sensor_to_scene_pose(
+        self,
+        sensor: ncore.data.CameraSensorProtocol | ncore.data.LidarSensorProtocol,
+        frame_idx: int,
+        frame_timepoint: ncore.data.FrameTimepoint = ncore.data.FrameTimepoint.END,
+    ) -> np.ndarray:
+        """Return sensor-to-scene pose in the same scene frame as parser cameras/points."""
+        T_sensor_scene = self._ncore_world_to_scene_poses(
+            sensor.get_frames_T_sensor_target(
+                "world", frame_idx, frame_timepoint=frame_timepoint
+            )
+        )
+        return self._apply_normalization_to_poses(T_sensor_scene).astype(np.float32)
+
+    def _load_lidar_frame_point_clouds(
+        self,
+        sequence_loader: ncore.data.SequenceLoaderProtocol,
+        source_id: str,
+        step_frame: int,
+    ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        """Load lidar frame point clouds from older NCore loaders."""
+        if source_id not in sequence_loader.lidar_ids:
+            raise ValueError(
+                "NCoreParser: generic point-cloud sources are unavailable "
+                f"and {source_id} is not a lidar source"
+            )
+
+        lidar = sequence_loader.get_lidar_sensor(source_id)
+        frame_timestamps = lidar.get_frames_timestamps_us(ncore.data.FrameTimepoint.END)
+        scale = self.world_global_to_scene.target_scale
+        points: List[np.ndarray] = []
+        colors: List[np.ndarray] = []
+        for frame_idx, pc_ts in enumerate(frame_timestamps):
+            pc_ts = int(pc_ts)
+            if not (self.time_range_us.start <= pc_ts < self.time_range_us.stop):
+                continue
+            if frame_idx % step_frame != 0:
+                continue
+
+            try:
+                pc = lidar.get_frame_point_cloud(
+                    frame_idx, motion_compensation=True, with_start_points=False
+                )
+            except Exception as exc:
+                print(
+                    f"[NCoreParser] Warning: failed to load lidar point cloud "
+                    f"{frame_idx} from {source_id}: {exc}"
+                )
+                continue
+
+            xyz_sensor = np.asarray(pc.xyz_m_end, dtype=np.float32)
+            if not len(xyz_sensor):
+                continue
+            T_sensor_scene = self._ncore_world_to_scene_poses(
+                lidar.get_frames_T_sensor_target(
+                    "world",
+                    frame_idx,
+                    frame_timepoint=ncore.data.FrameTimepoint.END,
+                )
+            )
+            xyz_scene = (
+                (scale * T_sensor_scene[:3, :3]) @ xyz_sensor.T
+                + T_sensor_scene[:3, 3:4]
+            ).T
+            points.append(xyz_scene.astype(np.float32))
+            colors.append(np.full((len(xyz_scene), 3), 128, dtype=np.uint8))
+        return points, colors
+
     def _load_point_clouds(
         self,
         sequence_loader: ncore.data.SequenceLoaderProtocol,
@@ -598,8 +921,8 @@ class NCoreParser:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Load and transform point clouds to scene frame for Gaussian initialization.
 
-        Supports any PointCloudsSourceProtocol source (lidar, radar, or native
-        point clouds) via the unified ``get_point_clouds_source()`` API.
+        Supports the unified point-cloud API when available, and falls back to
+        lidar frame point clouds for older NCore loaders.
         """
         if not self.point_clouds_source_ids:
             print(
@@ -617,9 +940,15 @@ class NCoreParser:
         all_colors: List[np.ndarray] = []
 
         for source_id in self.point_clouds_source_ids:
-            source: PointCloudsSourceProtocol = sequence_loader.get_point_clouds_source(
-                source_id
-            )
+            if not hasattr(sequence_loader, "get_point_clouds_source"):
+                points, colors = self._load_lidar_frame_point_clouds(
+                    sequence_loader, source_id, step_frame
+                )
+                all_points.extend(points)
+                all_colors.extend(colors)
+                continue
+
+            source = sequence_loader.get_point_clouds_source(source_id)
             ts = source.pc_timestamps_us
 
             for pc_idx in range(source.pcs_count):
@@ -727,9 +1056,11 @@ class NCoreDataset(torch.utils.data.Dataset):
         self,
         parser: NCoreParser,
         split: str = "train",
+        load_lidar: bool = False,
     ) -> None:
         self.parser = parser
         self.split = split
+        self.load_lidar = load_lidar
 
         # Build train/val split indices over the flat frame list.
         all_indices = np.arange(len(parser.frame_list))
@@ -743,6 +1074,7 @@ class NCoreDataset(torch.utils.data.Dataset):
         self._camera_sensors: Optional[
             Dict[str, ncore.data.CameraSensorProtocol]
         ] = None
+        self._lidar_sensor: Optional[ncore.data.LidarSensorProtocol] = None
         self._current_worker_id: Optional[int] = None
 
     def _init_worker(self) -> None:
@@ -775,6 +1107,11 @@ class NCoreDataset(torch.utils.data.Dataset):
             cid: self._sequence_loader.get_camera_sensor(cid)
             for cid in self.parser.camera_ids
         }
+        self._lidar_sensor = (
+            self._sequence_loader.get_lidar_sensor(self.parser.lidar_ids[0])
+            if self.load_lidar and self.parser.lidar_ids
+            else None
+        )
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -839,5 +1176,49 @@ class NCoreDataset(torch.utils.data.Dataset):
 
         if valid_mask is not None:
             data["mask"] = torch.from_numpy(valid_mask).bool()
+
+        if self.load_lidar:
+            assert self._lidar_sensor is not None
+
+            camera_timestamp_us = int(sensor.get_frame_timestamp_us(frame_idx))
+            lidar_frame_idx = _get_nearest_lidar_frame_index(
+                self._lidar_sensor, camera_timestamp_us
+            )
+            (
+                lidar_ranges,
+                lidar_intensities,
+                lidar_return_mask,
+            ) = _load_native_lidar_images(
+                self._lidar_sensor,
+                lidar_frame_idx,
+                load_intensity=True,
+            )
+            assert lidar_intensities is not None
+            range_scale = self.parser.normalization_scale
+            if range_scale != 1.0:
+                lidar_ranges = lidar_ranges * np.float32(range_scale)
+            lidar_sensor_to_scene_start = self.parser.get_sensor_to_scene_pose(
+                self._lidar_sensor,
+                lidar_frame_idx,
+                frame_timepoint=ncore.data.FrameTimepoint.START,
+            )
+            lidar_sensor_to_scene_end = self.parser.get_sensor_to_scene_pose(
+                self._lidar_sensor,
+                lidar_frame_idx,
+                frame_timepoint=ncore.data.FrameTimepoint.END,
+            )
+
+            data["lidar_ranges"] = torch.from_numpy(lidar_ranges).float()
+            data["lidar_intensities"] = torch.from_numpy(lidar_intensities).float()
+            data["lidar_return_mask"] = torch.from_numpy(lidar_return_mask).bool()
+            data["lidar_sensor_to_scene"] = torch.from_numpy(
+                lidar_sensor_to_scene_end
+            ).float()
+            data["lidar_sensor_to_scene_start"] = torch.from_numpy(
+                lidar_sensor_to_scene_start
+            ).float()
+            data["lidar_sensor_to_scene_end"] = torch.from_numpy(
+                lidar_sensor_to_scene_end
+            ).float()
 
         return data

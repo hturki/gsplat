@@ -92,6 +92,49 @@ def render_mode_has_only_color(mode: RenderMode) -> bool:
     return not render_mode_has_depth_channel(mode) and render_mode_has_color(mode)
 
 
+def _generate_eval3d_rays(
+    *,
+    viewmats: Tensor,
+    viewmats_rs: Optional[Tensor],
+    Ks: Tensor,
+    width: int,
+    height: int,
+    camera_model: CameraModel,
+    rolling_shutter: RollingShutterType,
+    lidar_coeffs: Optional[RowOffsetStructuredSpinningLidarModelParametersExt],
+) -> Tensor:
+    from .cuda._torch_cameras import _BaseCameraModel
+    from .cuda._torch_impl_eval3d import _generate_rays
+
+    batch_dims = viewmats.shape[:-3]
+    C = viewmats.shape[-3]
+    I = math.prod(batch_dims) * C
+    viewmats_flat = viewmats.reshape(I, 4, 4)
+    viewmats_rs_flat = (
+        viewmats_rs.reshape(I, 4, 4) if viewmats_rs is not None else None
+    )
+    Ks_flat = Ks.reshape(I, 3, 3)
+    camera = _BaseCameraModel.create(
+        width=width,
+        height=height,
+        camera_model=camera_model,
+        focal_lengths=Ks_flat[:, [0, 1], [0, 1]],
+        principal_points=Ks_flat[:, [0, 1], [2, 2]],
+        rs_type=rolling_shutter,
+        lidar_coeffs=lidar_coeffs,
+    )
+    rays = _generate_rays(camera, width, height, viewmats_flat, viewmats_rs_flat)
+    return rays.reshape(batch_dims + (C, height, width, 6))
+
+
+def _scale_ray_directions(rays: Tensor, ray_direction_scale: float) -> Tensor:
+    if ray_direction_scale == 1.0:
+        return rays
+    scaled = rays.clone()
+    scaled[..., 3:] = scaled[..., 3:] * ray_direction_scale
+    return scaled
+
+
 def _compute_view_dirs_packed(
     means: Tensor,  # [..., N, 3]
     campos: Tensor,  # [..., C, 3]
@@ -289,6 +332,7 @@ def rasterization(
     rays: Optional[
         Tensor
     ] = None,  # [..., C, H, W, 6] -> ox, oy, oz, dx*spread, dy*spread, dz*spread
+    ray_direction_scale: float = 1.0,
     # distortion
     radial_coeffs: Optional[Tensor] = None,  # [..., C, 6] or [..., C, 4]
     tangential_coeffs: Optional[Tensor] = None,  # [..., C, 2]
@@ -299,9 +343,9 @@ def rasterization(
     # rolling shutter
     rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
     viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
-    # unscented transform (for 3DGUT)
+    # Unscented transform (for 3DGUT)
     ut_params: Optional[UnscentedTransformParameters] = None,
-    # extra signal channels (order in output: RGB, depth, extra)
+    # Extra signal channels returned separately in meta["render_extra_signals"].
     extra_signals: Optional[
         Tensor
     ] = None,  # [..., (C,) N, E] or [..., (C,) N, K, 3] when extra_signals_sh_degree set
@@ -356,8 +400,8 @@ def rasterization(
         - "RGB-Ed": RGB + expected hit distance
 
         "RGB" renders only the colored image. For combined modes, depth is the last channel.
-        When extra_signals are present, render_colors is RGB + depth only (4 channels);
-        extra channels are returned in ``meta["render_extra_signals"]``.
+        When extra_signals are present, render_colors contains only the requested
+        color/depth channels; extra channels are returned in ``meta["render_extra_signals"]``.
 
     .. note::
         **Extra signals**: Optional `extra_signals` are rendered and returned in ``meta["render_extra_signals"]``
@@ -480,6 +524,9 @@ def rasterization(
             sorting Gaussians during rasterization. When True, Gaussians are sorted by their
             z-coordinate in camera space. When False, they are sorted by their Euclidean
             distance from the camera origin. Default is True.
+        rays: Optional precomputed eval3d rays. Ray directions may encode a sensor
+            footprint scale rather than a unit direction.
+        ray_direction_scale: Scale applied to eval3d ray directions. Default is 1.0.
         radial_coeffs: Opencv pinhole/fisheye radial distortion coefficients. Default is None.
             For pinhole camera, the shape should be [..., C, 6]. For fisheye camera, the shape
             should be [..., C, 4].
@@ -584,6 +631,8 @@ def rasterization(
     assert (camera_model == "lidar") == (
         lidar_coeffs is not None
     ), "Lidar coefficients must be given if and only if camera model is lidar"
+    if ray_direction_scale <= 0.0:
+        raise ValueError("ray_direction_scale must be positive.")
 
     def reshape_view(C: int, world_view: torch.Tensor, N_world: list) -> torch.Tensor:
         view_list = list(
@@ -706,6 +755,23 @@ def rasterization(
 
         # Silently change C from local #Cameras to global #Cameras.
         C = len(viewmats)
+
+    if ray_direction_scale != 1.0:
+        if not with_eval3d:
+            raise ValueError("ray_direction_scale requires with_eval3d=True.")
+        if rays is None:
+            rays = _generate_eval3d_rays(
+                viewmats=viewmats,
+                viewmats_rs=viewmats_rs,
+                Ks=Ks,
+                width=width,
+                height=height,
+                camera_model=camera_model,
+                rolling_shutter=rolling_shutter,
+                lidar_coeffs=lidar_coeffs,
+            )
+        rays = _scale_ray_directions(rays, ray_direction_scale)
+        meta["ray_direction_scale"] = ray_direction_scale
 
     if with_ut:
         # Use provided UT parameters or create default
@@ -1108,6 +1174,10 @@ def rasterization(
         }
     )
 
+    rays_eval3d = None
+    if rays is not None:
+        rays_eval3d = rays.reshape(batch_dims + (C, height * width, 6))
+
     # print("rank", world_rank, "Before rasterize_to_pixels")
     if proj_features.shape[-1] > channel_chunk:
         # slice into chunks
@@ -1140,7 +1210,7 @@ def rasterization(
                     opacities=opacities,
                     viewmats=viewmats,
                     Ks=Ks,
-                    rays=rays,
+                    rays=rays_eval3d,
                     image_width=width,
                     image_height=height,
                     tile_size=tile_size,
@@ -1202,7 +1272,7 @@ def rasterization(
                 opacities=opacities,
                 viewmats=viewmats,
                 Ks=Ks,
-                rays=rays,
+                rays=rays_eval3d,
                 image_width=width,
                 image_height=height,
                 tile_size=tile_size,
@@ -1342,7 +1412,7 @@ def _rasterization(
     lidar_coeffs: Optional[RowOffsetStructuredSpinningLidarModelParametersExt] = None,
     extra_signals: Optional[
         Tensor
-    ] = None,  # [..., (C,) N, 3] or [..., (C,) N, K, 3] when extra_signals_sh_degree set
+    ] = None,  # [..., (C,) N, E] or [..., (C,) N, K, 3] when extra_signals_sh_degree set
     extra_signals_sh_degree: Optional[int] = None,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """A version of rasterization() that utilies on PyTorch's autograd.
@@ -1498,6 +1568,10 @@ def _rasterization(
     isect_offsets = isect_offset_encode(isect_ids, I, tile_width, tile_height)
     isect_offsets = isect_offsets.reshape(batch_dims + (C, tile_height, tile_width))
 
+    rays_eval3d = None
+    if rays is not None:
+        rays_eval3d = rays.reshape(batch_dims + (C, height * width, 6))
+
     # Turn colors into [..., C, N, D] or [..., nnz, D] to pass into rasterize_to_pixels()
     # Make sure they're clamped if evaluating SH.
     if has_color:
@@ -1580,7 +1654,7 @@ def _rasterization(
                     Ks=Ks,
                     image_width=width,
                     image_height=height,
-                    rays=rays,
+                    rays=rays_eval3d,
                     lidar_coeffs=lidar_coeffs,
                     tile_size=tile_size,
                     isect_offsets=isect_offsets,
@@ -1625,7 +1699,7 @@ def _rasterization(
                 Ks=Ks,
                 image_width=width,
                 image_height=height,
-                rays=rays,
+                rays=rays_eval3d,
                 camera_model=camera_model,
                 lidar_coeffs=lidar_coeffs,
                 tile_size=tile_size,
